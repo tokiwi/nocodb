@@ -1127,6 +1127,7 @@ export class ExportService {
           baseModel,
           ignoreViewFilterAndSort: !dataExportMode,
           limitOverride: limit,
+          // @ts-ignore
           skipSortBasedOnOrderCol: true,
         })
         .then((result) => {
@@ -1229,6 +1230,7 @@ export class ExportService {
           ignoreViewFilterAndSort: true,
           limitOverride: limit,
           apiVersion: NcApiVersion.V1,
+          // @ts-ignore
           skipSortBasedOnOrderCol: true,
         })
         .then((result) => {
