@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { AsyncLocalStorage } from 'async_hooks';
 import autoBind from 'auto-bind';
 import BigNumber from 'bignumber.js';
 import DataLoader from 'dataloader';
@@ -159,6 +160,9 @@ const INSERT_REGEX = /^(\(|)insert/i;
  * @classdesc Base class for models
  */
 class BaseModelSqlv2 implements IBaseModelSqlV2 {
+  /** AsyncLocalStorage for tracking transaction context across async boundaries */
+  private static transactionStorage = new AsyncLocalStorage<CustomTransaction>();
+
   /** The base database driver (always non-transactional) */
   protected _dbDriver: XKnex;
   /** Optional transaction instance - when set, operations use this instead of _dbDriver */
@@ -182,6 +186,11 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
    * This ensures all operations within a transaction use the same transaction context.
    */
   public get dbDriver() {
+    // Check AsyncLocalStorage for RLS transaction context (takes precedence)
+    const rlsTransaction = BaseModelSqlv2.transactionStorage.getStore();
+    if (rlsTransaction) {
+      return rlsTransaction;
+    }
     return this._activeTransaction || this._dbDriver;
   }
 
@@ -243,7 +252,14 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   private async executeWithContext<T>(
     queryFn: (trx: XKnex) => Promise<T>,
   ): Promise<T> {
-    if (!isPgRlsEnabled || this.source?.type !== 'pg') {
+    if (!isPgRlsEnabled) {
+      return queryFn(this.dbDriver);
+    }
+
+    // Load source if not already loaded to check database type
+    const source = await this.getSource();
+
+    if (source?.type !== 'pg') {
       return queryFn(this.dbDriver);
     }
 
@@ -254,16 +270,24 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
 
     // use existing transaction if available
     if (this._activeTransaction) {
-      await this._activeTransaction.raw('SET LOCAL nc.user_id = ?', [
-        this.context.user.id,
-      ]);
+      await this._activeTransaction.raw(
+        `SET LOCAL nc.user_id = '${this.context.user.id}'`,
+      );
       return queryFn(this._activeTransaction);
     }
 
     // wrap in transaction for automatic context cleanup
     return this.dbDriver.transaction(async (trx) => {
-      await trx.raw('SET LOCAL nc.user_id = ?', [this.context.user.id]);
-      return queryFn(trx);
+      await trx.raw(`SET LOCAL nc.user_id = '${this.context.user.id}'`);
+
+      // Use AsyncLocalStorage to track the transaction across async boundaries
+      // This works with arrow functions and across await statements
+      return BaseModelSqlv2.transactionStorage.run(
+        trx as CustomTransaction,
+        async () => {
+          return await queryFn(trx);
+        },
+      );
     });
   }
 
@@ -277,12 +301,13 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   public async createTransaction(): Promise<CustomTransaction> {
     const trx = (await this._dbDriver.transaction()) as CustomTransaction;
 
-    if (
-      isPgRlsEnabled &&
-      this.source?.type === 'pg' &&
-      this.context?.user?.id != null
-    ) {
-      await trx.raw('SET LOCAL nc.user_id = ?', [this.context.user.id]);
+    if (isPgRlsEnabled && this.context?.user?.id != null) {
+      // Load source if not already loaded to check database type
+      const source = await this.getSource();
+
+      if (source?.type === 'pg') {
+        await trx.raw(`SET LOCAL nc.user_id = '${this.context.user.id}'`);
+      }
     }
 
     return trx;
@@ -2404,7 +2429,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   get clientType() {
-    return this.dbDriver.clientType();
+    return this.knex.clientType();
   }
 
   public async readRecord(params: {
