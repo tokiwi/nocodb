@@ -51,7 +51,7 @@ import type {
   UpdatePayload,
 } from 'nocodb-sdk';
 import type CustomKnex from '~/db/CustomKnex';
-import type { XKnex } from '~/db/CustomKnex';
+import type { XKnex, CustomTransaction } from '~/db/CustomKnex';
 import type { IBaseModelSqlV2 } from '~/db/IBaseModelSqlV2';
 import type {
   XcFilter,
@@ -130,6 +130,7 @@ import {
   remapWithAlias,
   removeBlankPropsAndMask,
 } from '~/utils';
+import { isPgRlsEnabled } from '~/utils/envs';
 import { MetaTable } from '~/utils/globals';
 import { chunkArray } from '~/utils/tsUtils';
 import { QUERY_STRING_FIELD_ID_ON_RESULT } from '~/constants';
@@ -231,6 +232,62 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
     autoBind(this);
   }
 
+  /**
+   * Executes a query function with the appropriate database context.
+   * For PostgreSQL with RLS enabled, wraps the query in a transaction with user context.
+   * For other databases, executes the query directly.
+   *
+   * @param queryFn - Function that executes the query, receives database driver/transaction
+   * @returns Result from the query function
+   */
+  private async executeWithContext<T>(
+    queryFn: (trx: XKnex) => Promise<T>,
+  ): Promise<T> {
+    if (!isPgRlsEnabled || this.source?.type !== 'pg') {
+      return queryFn(this.dbDriver);
+    }
+
+    // skip context setup for system queries
+    if (this.context?.user?.id == null) {
+      return queryFn(this.dbDriver);
+    }
+
+    // use existing transaction if available
+    if (this._activeTransaction) {
+      await this._activeTransaction.raw('SET LOCAL nc.user_id = ?', [
+        this.context.user.id,
+      ]);
+      return queryFn(this._activeTransaction);
+    }
+
+    // wrap in transaction for automatic context cleanup
+    return this.dbDriver.transaction(async (trx) => {
+      await trx.raw('SET LOCAL nc.user_id = ?', [this.context.user.id]);
+      return queryFn(trx);
+    });
+  }
+
+  /**
+   * Creates a database transaction for write operations.
+   * Use this method instead of this.dbDriver.transaction() to ensure
+   * proper context setup (e.g., RLS context for PostgreSQL).
+   *
+   * @returns Transaction instance
+   */
+  public async createTransaction(): Promise<CustomTransaction> {
+    const trx = (await this._dbDriver.transaction()) as CustomTransaction;
+
+    if (
+      isPgRlsEnabled &&
+      this.source?.type === 'pg' &&
+      this.context?.user?.id != null
+    ) {
+      await trx.raw('SET LOCAL nc.user_id = ?', [this.context.user.id]);
+    }
+
+    return trx;
+  }
+
   public async readByPk(
     id?: any,
     validateFormula = false,
@@ -251,60 +308,62 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       extractOrderColumn?: boolean;
     } = {},
   ): Promise<any> {
-    const qb = this.dbDriver(this.tnPath);
-    const { ast, dependencyFields, parsedQuery } = await getAst(this.context, {
-      query,
-      model: this.model,
-      view: ignoreView
-        ? null
-        : this.viewId && (await View.get(this.context, this.viewId)),
-      getHiddenColumn,
-      throwErrorIfInvalidParams,
-      extractOnlyPrimaries,
-      extractOrderColumn,
-      apiVersion,
-      skipSubstitutingColumnIds:
-        this.context.api_version === NcApiVersion.V3 &&
-        query?.[QUERY_STRING_FIELD_ID_ON_RESULT] === 'true',
-    });
-
-    await this.selectObject({
-      ...(dependencyFields ?? {}),
-      qb,
-      validateFormula,
-    });
-
-    qb.where(_wherePk(this.model.primaryKeys, id));
-    let data;
-
-    try {
-      data = await this.execAndParse(qb, null, {
-        first: true,
+    return this.executeWithContext(async (trx) => {
+      const qb = trx(this.tnPath);
+      const { ast, dependencyFields, parsedQuery } = await getAst(this.context, {
+        query,
+        model: this.model,
+        view: ignoreView
+          ? null
+          : this.viewId && (await View.get(this.context, this.viewId)),
+        getHiddenColumn,
+        throwErrorIfInvalidParams,
+        extractOnlyPrimaries,
+        extractOrderColumn,
         apiVersion,
         skipSubstitutingColumnIds:
           this.context.api_version === NcApiVersion.V3 &&
           query?.[QUERY_STRING_FIELD_ID_ON_RESULT] === 'true',
       });
-    } catch (e) {
-      if (
-        validateFormula ||
-        !haveFormulaColumn(await this.model.getColumns(this.context))
-      )
-        throw e;
-      logger.log(e);
-      return this.readByPk(id, true, query, {
-        apiVersion,
+
+      await this.selectObject({
+        ...(dependencyFields ?? {}),
+        qb,
+        validateFormula,
       });
-    }
 
-    if (data) {
-      const proto = await this.getProto();
-      data.__proto__ = proto;
-    }
+      qb.where(_wherePk(this.model.primaryKeys, id));
+      let data;
 
-    return data
-      ? await nocoExecute(ast, data as ResolverObj, {}, parsedQuery)
-      : null;
+      try {
+        data = await this.execAndParse(qb, null, {
+          first: true,
+          apiVersion,
+          skipSubstitutingColumnIds:
+            this.context.api_version === NcApiVersion.V3 &&
+            query?.[QUERY_STRING_FIELD_ID_ON_RESULT] === 'true',
+        });
+      } catch (e) {
+        if (
+          validateFormula ||
+          !haveFormulaColumn(await this.model.getColumns(this.context))
+        )
+          throw e;
+        logger.log(e);
+        return this.readByPk(id, true, query, {
+          apiVersion,
+        });
+      }
+
+      if (data) {
+        const proto = await this.getProto();
+        data.__proto__ = proto;
+      }
+
+      return data
+        ? await nocoExecute(ast, data as ResolverObj, {}, parsedQuery)
+        : null;
+    });
   }
 
   public async readByPkFromModel(
@@ -361,19 +420,21 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   public async exist(id?: any): Promise<any> {
-    const qb = this.dbDriver(this.tnPath);
-    await this.model.getColumns(this.context);
-    const pks = this.model.primaryKeys;
+    return this.executeWithContext(async (trx) => {
+      const qb = trx(this.tnPath);
+      await this.model.getColumns(this.context);
+      const pks = this.model.primaryKeys;
 
-    if (!pks.length) return false;
+      if (!pks.length) return false;
 
-    qb.select(pks[0].column_name);
+      qb.select(pks[0].column_name);
 
-    if ((id + '').split('___').length != pks?.length) {
-      return false;
-    }
-    qb.where(_wherePk(pks, id)).first();
-    return !!(await this.execAndParse(qb, null, { raw: true, first: true }));
+      if ((id + '').split('___').length != pks?.length) {
+        return false;
+      }
+      qb.where(_wherePk(pks, id)).first();
+      return !!(await this.execAndParse(qb, null, { raw: true, first: true }));
+    });
   }
 
   // todo: add support for sortArrJson
@@ -385,65 +446,67 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
     } = {},
     validateFormula = false,
   ): Promise<any> {
-    const columns = await this.model.getColumns(this.context);
-    const { where, ...rest } = this._getListArgs(args as any);
-    const qb = this.dbDriver(this.tnPath);
-    await this.selectObject({ ...args, qb, validateFormula, columns });
+    return this.executeWithContext(async (trx) => {
+      const columns = await this.model.getColumns(this.context);
+      const { where, ...rest } = this._getListArgs(args as any);
+      const qb = trx(this.tnPath);
+      await this.selectObject({ ...args, qb, validateFormula, columns });
 
-    const aliasColObjMap = await this.model.getAliasColObjMap(
-      this.context,
-      columns,
-    );
-    const sorts = extractSortsObject(this.context, rest?.sort, aliasColObjMap);
-    const { filters: filterObj } = extractFilterFromXwhere(
-      this.context,
-      where,
-      aliasColObjMap,
-    );
+      const aliasColObjMap = await this.model.getAliasColObjMap(
+        this.context,
+        columns,
+      );
+      const sorts = extractSortsObject(this.context, rest?.sort, aliasColObjMap);
+      const { filters: filterObj } = extractFilterFromXwhere(
+        this.context,
+        where,
+        aliasColObjMap,
+      );
 
-    await conditionV2(
-      this,
-      [
-        new Filter({
-          children: args.filterArr || [],
-          is_group: true,
-          logical_op: 'and',
-        }),
-        new Filter({
-          children: filterObj,
-          is_group: true,
-          logical_op: 'and',
-        }),
-      ],
-      qb,
-    );
+      await conditionV2(
+        this,
+        [
+          new Filter({
+            children: args.filterArr || [],
+            is_group: true,
+            logical_op: 'and',
+          }),
+          new Filter({
+            children: filterObj,
+            is_group: true,
+            logical_op: 'and',
+          }),
+        ],
+        qb,
+      );
 
-    const orderColumn = columns.find((c) => isOrderCol(c));
+      const orderColumn = columns.find((c) => isOrderCol(c));
 
-    if (Array.isArray(sorts) && sorts?.length) {
-      await sortV2(this, sorts, qb);
-    } else if (orderColumn) {
-      qb.orderBy(orderColumn.column_name);
-    } else if (this.model.primaryKey) {
-      // sort by primary key if not autogenerated string
-      // if autogenerated string sort by created_at column if present
-      qb.orderBy(this.model.primaryKey.column_name);
-    }
+      if (Array.isArray(sorts) && sorts?.length) {
+        await sortV2(this, sorts, qb);
+      } else if (orderColumn) {
+        qb.orderBy(orderColumn.column_name);
+      } else if (this.model.primaryKey) {
+        // sort by primary key if not autogenerated string
+        // if autogenerated string sort by created_at column if present
+        qb.orderBy(this.model.primaryKey.column_name);
+      }
 
-    let data;
+      let data;
 
-    try {
-      data = await this.execAndParse(qb, null, { first: true });
-    } catch (e) {
-      if (validateFormula || !haveFormulaColumn(columns)) throw e;
-      logger.log(e);
-      return this.findOne(args, true);
-    }
+      try {
+        data = await this.execAndParse(qb, null, { first: true });
+      } catch (e) {
+        if (validateFormula || !haveFormulaColumn(columns)) throw e;
+        logger.log(e);
+        return this.findOne(args, true);
+      }
 
-    if (data) {
-      data.__proto__ = await this.getProto();
-    }
-    return data;
+      if (data) {
+        data.__proto__ = await this.getProto();
+      }
+      return data;
+    });
   }
 
   public async list(
@@ -470,186 +533,188 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       skipSortBasedOnOrderCol?: boolean;
     } = {},
   ): Promise<any> {
-    const {
-      ignoreViewFilterAndSort = false,
-      ignorePagination = false,
-      validateFormula = false,
-      throwErrorIfInvalidParams = false,
-      limitOverride,
-      skipSortBasedOnOrderCol = false,
-    } = options;
+    return this.executeWithContext(async (trx) => {
+      const {
+        ignoreViewFilterAndSort = false,
+        ignorePagination = false,
+        validateFormula = false,
+        throwErrorIfInvalidParams = false,
+        limitOverride,
+        skipSortBasedOnOrderCol = false,
+      } = options;
 
-    const columns = await this.model.getColumns(this.context);
+      const columns = await this.model.getColumns(this.context);
 
-    const { where, fields, ...rest } = this._getListArgs(args as any);
+      const { where, fields, ...rest } = this._getListArgs(args as any);
 
-    const qb = this.dbDriver(this.tnPath);
+      const qb = trx(this.tnPath);
 
-    await this.selectObject({
-      qb,
-      fieldsSet: args.fieldsSet,
-      viewId: this.viewId,
-      validateFormula,
-      columns,
-    });
-    if (+rest?.shuffle) {
-      await this.shuffle({ qb });
-    }
-
-    const aliasColObjMap = await this.model.getAliasColObjMap(
-      this.context,
-      columns,
-    );
-    let sorts = extractSortsObject(
-      this.context,
-      rest?.sort,
-      aliasColObjMap,
-      throwErrorIfInvalidParams,
-      args?.apiVersion,
-    );
-    const { filters: filterObj } = extractFilterFromXwhere(
-      this.context,
-      where,
-      aliasColObjMap,
-      throwErrorIfInvalidParams,
-    );
-    // todo: replace with view id
-    if (!ignoreViewFilterAndSort && this.viewId) {
-      await conditionV2(
-        this,
-        [
-          ...(args.customConditions
-            ? [
-                new Filter({
-                  children: args.customConditions,
-                  is_group: true,
-                }),
-              ]
-            : []),
-          new Filter({
-            children:
-              (await Filter.rootFilterList(this.context, {
-                viewId: this.viewId,
-              })) || [],
-            is_group: true,
-          }),
-          new Filter({
-            children: args.filterArr || [],
-            is_group: true,
-            logical_op: 'and',
-          }),
-          new Filter({
-            children: filterObj,
-            is_group: true,
-            logical_op: 'and',
-          }),
-        ],
+      await this.selectObject({
         qb,
-        undefined,
-        throwErrorIfInvalidParams,
-      );
-
-      if (!sorts)
-        sorts = args.sortArr?.length
-          ? args.sortArr
-          : await Sort.list(this.context, { viewId: this.viewId });
-
-      await sortV2(this, sorts, qb, undefined, throwErrorIfInvalidParams);
-    } else {
-      await conditionV2(
-        this,
-        [
-          ...(args.customConditions
-            ? [
-                new Filter({
-                  children: args.customConditions,
-                  is_group: true,
-                }),
-              ]
-            : []),
-          new Filter({
-            children: args.filterArr || [],
-            is_group: true,
-            logical_op: 'and',
-          }),
-          new Filter({
-            children: filterObj,
-            is_group: true,
-            logical_op: 'and',
-          }),
-        ],
-        qb,
-        undefined,
-        throwErrorIfInvalidParams,
-      );
-
-      if (!sorts) sorts = args.sortArr;
-
-      await sortV2(this, sorts, qb, undefined, throwErrorIfInvalidParams);
-    }
-
-    // skip sorting based on order column if specified in options
-    if (!skipSortBasedOnOrderCol) {
-      const orderColumn = columns.find((c) => isOrderCol(c));
-
-      // sort by order column if present
-      if (orderColumn) {
-        qb.orderBy(orderColumn.column_name);
-      }
-    }
-
-    // Ensure stable ordering:
-    // - Use auto-increment PK if available
-    // - Otherwise, fallback to system CreatedTime
-    // This avoids issues when order column has duplicates
-    if (this.model.primaryKey && this.model.primaryKey.ai) {
-      qb.orderBy(this.model.primaryKey.column_name);
-    } else {
-      const createdCol = this.model.columns.find(
-        (c) => c.uidt === UITypes.CreatedTime && c.system,
-      );
-      if (createdCol) qb.orderBy(createdCol.column_name);
-    }
-
-    if (rest.pks) {
-      const pks = rest.pks.split(',');
-      qb.where((innerQb) => {
-        pks.forEach((pk) => {
-          innerQb.orWhere(_wherePk(this.model.primaryKeys, pk));
-        });
-        return innerQb;
+        fieldsSet: args.fieldsSet,
+        viewId: this.viewId,
+        validateFormula,
+        columns,
       });
-    }
+      if (+rest?.shuffle) {
+        await this.shuffle({ qb });
+      }
 
-    // if limitOverride is provided, use it as limit for the query (for internal usage eg. calendar, export)
-    if (!ignorePagination) {
-      if (!limitOverride) {
-        applyPaginate(qb, rest);
+      const aliasColObjMap = await this.model.getAliasColObjMap(
+        this.context,
+        columns,
+      );
+      let sorts = extractSortsObject(
+        this.context,
+        rest?.sort,
+        aliasColObjMap,
+        throwErrorIfInvalidParams,
+        args?.apiVersion,
+      );
+      const { filters: filterObj } = extractFilterFromXwhere(
+        this.context,
+        where,
+        aliasColObjMap,
+        throwErrorIfInvalidParams,
+      );
+      // todo: replace with view id
+      if (!ignoreViewFilterAndSort && this.viewId) {
+        await conditionV2(
+          this,
+          [
+            ...(args.customConditions
+              ? [
+                  new Filter({
+                    children: args.customConditions,
+                    is_group: true,
+                  }),
+                ]
+              : []),
+            new Filter({
+              children:
+                (await Filter.rootFilterList(this.context, {
+                  viewId: this.viewId,
+                })) || [],
+              is_group: true,
+            }),
+            new Filter({
+              children: args.filterArr || [],
+              is_group: true,
+              logical_op: 'and',
+            }),
+            new Filter({
+              children: filterObj,
+              is_group: true,
+              logical_op: 'and',
+            }),
+          ],
+          qb,
+          undefined,
+          throwErrorIfInvalidParams,
+        );
+
+        if (!sorts)
+          sorts = args.sortArr?.length
+            ? args.sortArr
+            : await Sort.list(this.context, { viewId: this.viewId });
+
+        await sortV2(this, sorts, qb, undefined, throwErrorIfInvalidParams);
       } else {
-        applyPaginate(qb, { ...rest, limit: limitOverride });
+        await conditionV2(
+          this,
+          [
+            ...(args.customConditions
+              ? [
+                  new Filter({
+                    children: args.customConditions,
+                    is_group: true,
+                  }),
+                ]
+              : []),
+            new Filter({
+              children: args.filterArr || [],
+              is_group: true,
+              logical_op: 'and',
+            }),
+            new Filter({
+              children: filterObj,
+              is_group: true,
+              logical_op: 'and',
+            }),
+          ],
+          qb,
+          undefined,
+          throwErrorIfInvalidParams,
+        );
+
+        if (!sorts) sorts = args.sortArr;
+
+        await sortV2(this, sorts, qb, undefined, throwErrorIfInvalidParams);
       }
-    }
-    const proto = await this.getProto();
 
-    let data;
-    try {
-      data = await this.execAndParse(qb, undefined, {
-        apiVersion: args.apiVersion ?? this.context.api_version,
-        skipSubstitutingColumnIds: options.skipSubstitutingColumnIds,
-      });
-    } catch (e) {
-      if (validateFormula || !haveFormulaColumn(columns)) throw e;
-      logger.log(e);
-      return this.list(args, {
-        ignoreViewFilterAndSort,
-        ignorePagination,
-        validateFormula: true,
-      });
-    }
+      // skip sorting based on order column if specified in options
+      if (!skipSortBasedOnOrderCol) {
+        const orderColumn = columns.find((c) => isOrderCol(c));
 
-    return data?.map((d) => {
-      d.__proto__ = proto;
-      return d;
+        // sort by order column if present
+        if (orderColumn) {
+          qb.orderBy(orderColumn.column_name);
+        }
+      }
+
+      // Ensure stable ordering:
+      // - Use auto-increment PK if available
+      // - Otherwise, fallback to system CreatedTime
+      // This avoids issues when order column has duplicates
+      if (this.model.primaryKey && this.model.primaryKey.ai) {
+        qb.orderBy(this.model.primaryKey.column_name);
+      } else {
+        const createdCol = this.model.columns.find(
+          (c) => c.uidt === UITypes.CreatedTime && c.system,
+        );
+        if (createdCol) qb.orderBy(createdCol.column_name);
+      }
+
+      if (rest.pks) {
+        const pks = rest.pks.split(',');
+        qb.where((innerQb) => {
+          pks.forEach((pk) => {
+            innerQb.orWhere(_wherePk(this.model.primaryKeys, pk));
+          });
+          return innerQb;
+        });
+      }
+
+      // if limitOverride is provided, use it as limit for the query (for internal usage eg. calendar, export)
+      if (!ignorePagination) {
+        if (!limitOverride) {
+          applyPaginate(qb, rest);
+        } else {
+          applyPaginate(qb, { ...rest, limit: limitOverride });
+        }
+      }
+      const proto = await this.getProto();
+
+      let data;
+      try {
+        data = await this.execAndParse(qb, undefined, {
+          apiVersion: args.apiVersion ?? this.context.api_version,
+          skipSubstitutingColumnIds: options.skipSubstitutingColumnIds,
+        });
+      } catch (e) {
+        if (validateFormula || !haveFormulaColumn(columns)) throw e;
+        logger.log(e);
+        return this.list(args, {
+          ignoreViewFilterAndSort,
+          ignorePagination,
+          validateFormula: true,
+        });
+      }
+
+      return data?.map((d) => {
+        d.__proto__ = proto;
+        return d;
+      });
     });
   }
 
@@ -663,94 +728,96 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
     ignoreViewFilterAndSort = false,
     throwErrorIfInvalidParams = false,
   ): Promise<any> {
-    const columns = await this.model.getColumns(this.context);
-    const { where } = this._getListArgs(args);
+    return this.executeWithContext(async (trx) => {
+      const columns = await this.model.getColumns(this.context);
+      const { where } = this._getListArgs(args);
 
-    const qb = this.dbDriver(this.tnPath);
+      const qb = trx(this.tnPath);
 
-    // qb.xwhere(where, await this.model.getAliasColMapping());
-    const aliasColObjMap = await this.model.getAliasColObjMap(
-      this.context,
-      columns,
-    );
-    const { filters: filterObj } = extractFilterFromXwhere(
-      this.context,
-      where,
-      aliasColObjMap,
-      throwErrorIfInvalidParams,
-    );
-
-    if (!ignoreViewFilterAndSort && this.viewId) {
-      await conditionV2(
-        this,
-        [
-          ...(args.customConditions
-            ? [
-                new Filter({
-                  children: args.customConditions,
-                  is_group: true,
-                }),
-              ]
-            : []),
-          new Filter({
-            children:
-              (await Filter.rootFilterList(this.context, {
-                viewId: this.viewId,
-              })) || [],
-            is_group: true,
-          }),
-          new Filter({
-            children: args.filterArr || [],
-            is_group: true,
-            logical_op: 'and',
-          }),
-          new Filter({
-            children: filterObj,
-            is_group: true,
-            logical_op: 'and',
-          }),
-          ...(args.filterArr || []),
-        ],
-        qb,
-        undefined,
+      // qb.xwhere(where, await this.model.getAliasColMapping());
+      const aliasColObjMap = await this.model.getAliasColObjMap(
+        this.context,
+        columns,
+      );
+      const { filters: filterObj } = extractFilterFromXwhere(
+        this.context,
+        where,
+        aliasColObjMap,
         throwErrorIfInvalidParams,
       );
-    } else {
-      await conditionV2(
-        this,
-        [
-          ...(args.customConditions
-            ? [
-                new Filter({
-                  children: args.customConditions,
-                  is_group: true,
-                }),
-              ]
-            : []),
-          new Filter({
-            children: args.filterArr || [],
-            is_group: true,
-            logical_op: 'and',
-          }),
-          new Filter({
-            children: filterObj,
-            is_group: true,
-            logical_op: 'and',
-          }),
-          ...(args.filterArr || []),
-        ],
-        qb,
-        undefined,
-        throwErrorIfInvalidParams,
-      );
-    }
 
-    qb.count(sanitize(this.model.primaryKey?.column_name) || '*', {
-      as: 'count',
-    }).first();
+      if (!ignoreViewFilterAndSort && this.viewId) {
+        await conditionV2(
+          this,
+          [
+            ...(args.customConditions
+              ? [
+                  new Filter({
+                    children: args.customConditions,
+                    is_group: true,
+                  }),
+                ]
+              : []),
+            new Filter({
+              children:
+                (await Filter.rootFilterList(this.context, {
+                  viewId: this.viewId,
+                })) || [],
+              is_group: true,
+            }),
+            new Filter({
+              children: args.filterArr || [],
+              is_group: true,
+              logical_op: 'and',
+            }),
+            new Filter({
+              children: filterObj,
+              is_group: true,
+              logical_op: 'and',
+            }),
+            ...(args.filterArr || []),
+          ],
+          qb,
+          undefined,
+          throwErrorIfInvalidParams,
+        );
+      } else {
+        await conditionV2(
+          this,
+          [
+            ...(args.customConditions
+              ? [
+                  new Filter({
+                    children: args.customConditions,
+                    is_group: true,
+                  }),
+                ]
+              : []),
+            new Filter({
+              children: args.filterArr || [],
+              is_group: true,
+              logical_op: 'and',
+            }),
+            new Filter({
+              children: filterObj,
+              is_group: true,
+              logical_op: 'and',
+            }),
+            ...(args.filterArr || []),
+          ],
+          qb,
+          undefined,
+          throwErrorIfInvalidParams,
+        );
+      }
 
-    return (await this.execAndParse(qb, null, { raw: true, first: true }))
-      ?.count;
+      qb.count(sanitize(this.model.primaryKey?.column_name) || '*', {
+        as: 'count',
+      }).first();
+
+      return (await this.execAndParse(qb, null, { raw: true, first: true }))
+        ?.count;
+    });
   }
 
   async groupByAndAggregate(
@@ -767,54 +834,56 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       groupByColumnName?: string;
     },
   ) {
-    const columns = await this.model.getColumns(this.context);
+    return this.executeWithContext(async (trx) => {
+      const columns = await this.model.getColumns(this.context);
 
-    const { where, ...rest } = this._getListArgs(args as any);
+      const { where, ...rest } = this._getListArgs(args as any);
 
-    const qb = this.dbDriver(this.tnPath);
-    const aggregateStatement = `${aggregateColumnName} as ${aggregateFn}__${aggregateColumnName}`;
+      const qb = trx(this.tnPath);
+      const aggregateStatement = `${aggregateColumnName} as ${aggregateFn}__${aggregateColumnName}`;
 
-    if (typeof qb[aggregateFn] === 'function') {
-      qb[aggregateFn](aggregateStatement);
-    } else {
-      throw new Error(`Unsupported aggregate function: ${aggregateFn}`);
-    }
+      if (typeof qb[aggregateFn] === 'function') {
+        qb[aggregateFn](aggregateStatement);
+      } else {
+        throw new Error(`Unsupported aggregate function: ${aggregateFn}`);
+      }
 
-    qb.select(args.groupByColumnName);
+      qb.select(args.groupByColumnName);
 
-    if (+rest?.shuffle) {
-      await this.shuffle({ qb });
-    }
+      if (+rest?.shuffle) {
+        await this.shuffle({ qb });
+      }
 
-    const aliasColObjMap = await this.model.getAliasColObjMap(
-      this.context,
-      columns,
-    );
+      const aliasColObjMap = await this.model.getAliasColObjMap(
+        this.context,
+        columns,
+      );
 
-    const { filters: filterObj } = extractFilterFromXwhere(
-      this.context,
-      where,
-      aliasColObjMap,
-    );
-    await conditionV2(
-      this,
-      [
-        new Filter({
-          children: filterObj,
-          is_group: true,
-          logical_op: 'and',
-        }),
-      ],
-      qb,
-    );
-    if (args?.groupByColumnName) {
-      qb.groupBy(args?.groupByColumnName);
-    }
-    if (args?.sortBy?.column_name) {
-      qb.orderBy(args.sortBy.column_name, args.sortBy.direction);
-    }
-    applyPaginate(qb, rest);
-    return await this.execAndParse(qb);
+      const { filters: filterObj } = extractFilterFromXwhere(
+        this.context,
+        where,
+        aliasColObjMap,
+      );
+      await conditionV2(
+        this,
+        [
+          new Filter({
+            children: filterObj,
+            is_group: true,
+            logical_op: 'and',
+          }),
+        ],
+        qb,
+      );
+      if (args?.groupByColumnName) {
+        qb.groupBy(args?.groupByColumnName);
+      }
+      if (args?.sortBy?.column_name) {
+        qb.orderBy(args.sortBy.column_name, args.sortBy.direction);
+      }
+      applyPaginate(qb, rest);
+      return await this.execAndParse(qb);
+    });
   }
 
   async bulkGroupByCount(
@@ -871,121 +940,290 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
     }>,
     view?: View,
   ) {
-    try {
-      if (!bulkFilterList?.length) {
-        return {};
-      }
-
-      const { where, aggregation } = this._getListArgs(args as any);
-
-      const columns = await this.model.getColumns(this.context);
-
-      let viewColumns: any[];
-      if (this.viewId) {
-        viewColumns = (
-          await GridViewColumn.list(this.context, this.viewId)
-        ).filter((c) => {
-          const col = this.model.columnsById[c.fk_column_id];
-          return c.show && (view?.show_system_fields || !isSystemColumn(col));
-        });
-
-        // By default, the aggregation is done based on the columns configured in the view
-        // If the aggregation parameter is provided, only the columns mentioned in the aggregation parameter are considered
-        // Also the aggregation type from the parameter is given preference over the aggregation type configured in the view
-        if (aggregation?.length) {
-          viewColumns = viewColumns
-            .map((c) => {
-              const agg = aggregation.find((a) => a.field === c.fk_column_id);
-              return new GridViewColumn({
-                ...c,
-                show: !!agg,
-                aggregation: agg ? agg.type : c.aggregation,
-              });
-            })
-            .filter((c) => c.show);
+    return this.executeWithContext(async (trx) => {
+      try {
+        if (!bulkFilterList?.length) {
+          return {};
         }
-      } else {
-        // If no viewId, use all model columns or those specified in aggregation
-        if (aggregation?.length) {
-          viewColumns = aggregation
-            .map((agg) => {
-              const col = this.model.columnsById[agg.field];
-              if (!col) return null;
-              return {
-                fk_column_id: col.id,
-                aggregation: agg.type,
-                show: true,
-              };
-            })
-            .filter(Boolean);
+
+        const { where, aggregation } = this._getListArgs(args as any);
+
+        const columns = await this.model.getColumns(this.context);
+
+        let viewColumns: any[];
+        if (this.viewId) {
+          viewColumns = (
+            await GridViewColumn.list(this.context, this.viewId)
+          ).filter((c) => {
+            const col = this.model.columnsById[c.fk_column_id];
+            return c.show && (view?.show_system_fields || !isSystemColumn(col));
+          });
+
+          // By default, the aggregation is done based on the columns configured in the view
+          // If the aggregation parameter is provided, only the columns mentioned in the aggregation parameter are considered
+          // Also the aggregation type from the parameter is given preference over the aggregation type configured in the view
+          if (aggregation?.length) {
+            viewColumns = viewColumns
+              .map((c) => {
+                const agg = aggregation.find((a) => a.field === c.fk_column_id);
+                return new GridViewColumn({
+                  ...c,
+                  show: !!agg,
+                  aggregation: agg ? agg.type : c.aggregation,
+                });
+              })
+              .filter((c) => c.show);
+          }
         } else {
-          viewColumns = [];
+          // If no viewId, use all model columns or those specified in aggregation
+          if (aggregation?.length) {
+            viewColumns = aggregation
+              .map((agg) => {
+                const col = this.model.columnsById[agg.field];
+                if (!col) return null;
+                return {
+                  fk_column_id: col.id,
+                  aggregation: agg.type,
+                  show: true,
+                };
+              })
+              .filter(Boolean);
+          } else {
+            viewColumns = [];
+          }
         }
-      }
 
-      const aliasColObjMap = await this.model.getAliasColObjMap(
-        this.context,
-        columns,
-      );
-
-      const qb = this.dbDriver(this.tnPath);
-
-      const aggregateExpressions = {};
-
-      // Construct aggregate expressions for each view column
-      for (const viewColumn of viewColumns) {
-        const col = this.model.columnsById[viewColumn.fk_column_id];
-        if (
-          !col ||
-          !viewColumn.aggregation ||
-          (isLinksOrLTAR(col) && col.system)
-        )
-          continue;
-
-        const aliasFieldName = col.id;
-        const aggSql = await applyAggregation({
-          baseModelSqlv2: this,
-          aggregation: viewColumn.aggregation,
-          column: col,
-        });
-
-        if (aggSql) {
-          aggregateExpressions[aliasFieldName] = aggSql;
-        }
-      }
-
-      if (!Object.keys(aggregateExpressions).length) {
-        return {};
-      }
-
-      let viewFilterList = [];
-      if (this.viewId) {
-        viewFilterList = await Filter.rootFilterList(this.context, {
-          viewId: this.viewId,
-        });
-      }
-
-      const selectors = [] as Array<Knex.Raw>;
-      // Generate a knex raw query for each filter in the bulkFilterList
-      for (const f of bulkFilterList) {
-        const tQb = this.dbDriver(this.tnPath);
-        const { filters: aggFilter } = extractFilterFromXwhere(
+        const aliasColObjMap = await this.model.getAliasColObjMap(
           this.context,
-          f.where,
+          columns,
+        );
+
+        const qb = trx(this.tnPath);
+
+        const aggregateExpressions = {};
+
+        // Construct aggregate expressions for each view column
+        for (const viewColumn of viewColumns) {
+          const col = this.model.columnsById[viewColumn.fk_column_id];
+          if (
+            !col ||
+            !viewColumn.aggregation ||
+            (isLinksOrLTAR(col) && col.system)
+          )
+            continue;
+
+          const aliasFieldName = col.id;
+          const aggSql = await applyAggregation({
+            baseModelSqlv2: this,
+            aggregation: viewColumn.aggregation,
+            column: col,
+          });
+
+          if (aggSql) {
+            aggregateExpressions[aliasFieldName] = aggSql;
+          }
+        }
+
+        if (!Object.keys(aggregateExpressions).length) {
+          return {};
+        }
+
+        let viewFilterList = [];
+        if (this.viewId) {
+          viewFilterList = await Filter.rootFilterList(this.context, {
+            viewId: this.viewId,
+          });
+        }
+
+        const selectors = [] as Array<Knex.Raw>;
+        // Generate a knex raw query for each filter in the bulkFilterList
+        for (const f of bulkFilterList) {
+          const tQb = trx(this.tnPath);
+          const { filters: aggFilter } = extractFilterFromXwhere(
+            this.context,
+            f.where,
+            aliasColObjMap,
+          );
+          let aggFilterJson = f.filterArrJson;
+          try {
+            aggFilterJson = JSON.parse(aggFilterJson as any);
+          } catch (_e) {}
+
+          await conditionV2(
+            this,
+            [
+              ...(this.viewId
+                ? [
+                    new Filter({
+                      children: viewFilterList || [],
+                      is_group: true,
+                    }),
+                  ]
+                : []),
+              new Filter({
+                children: args.filterArr || [],
+                is_group: true,
+                logical_op: 'and',
+              }),
+              new Filter({
+                children: extractFilterFromXwhere(
+                  this.context,
+                  where,
+                  aliasColObjMap,
+                ).filters,
+                is_group: true,
+                logical_op: 'and',
+              }),
+              new Filter({
+                children: aggFilter,
+                is_group: true,
+                logical_op: 'and',
+              }),
+              ...(aggFilterJson
+                ? [
+                    new Filter({
+                      children: aggFilterJson as Filter[],
+                      is_group: true,
+                    }),
+                  ]
+                : []),
+            ],
+            tQb,
+          );
+
+          let jsonBuildObject;
+
+          switch (this.dbDriver.client.config.client) {
+            case 'pg': {
+              jsonBuildObject = this.dbDriver.raw(
+                `JSON_BUILD_OBJECT(${Object.keys(aggregateExpressions)
+                  .map((key) => {
+                    return `'${key}', ${aggregateExpressions[key]}`;
+                  })
+                  .join(', ')})`,
+              );
+
+              break;
+            }
+            case 'mysql2': {
+              jsonBuildObject = this.dbDriver.raw(`JSON_OBJECT(
+                ${Object.keys(aggregateExpressions)
+                  .map((key) => `'${key}', ${aggregateExpressions[key]}`)
+                  .join(', ')})`);
+              break;
+            }
+
+            case 'sqlite3': {
+              jsonBuildObject = this.dbDriver.raw(`json_object(
+                  ${Object.keys(aggregateExpressions)
+                    .map((key) => `'${key}', ${aggregateExpressions[key]}`)
+                    .join(', ')})`);
+              break;
+            }
+            default:
+              NcError.notImplemented(
+                'This database is not supported for bulk aggregation',
+              );
+          }
+
+          tQb.select(jsonBuildObject);
+
+          if (this.dbDriver.client.config.client === 'mysql2') {
+            selectors.push(
+              this.dbDriver.raw('JSON_UNQUOTE(??) as ??', [
+                jsonBuildObject,
+                `${f.alias}`,
+              ]),
+            );
+          } else {
+            selectors.push(this.dbDriver.raw('(??) as ??', [tQb, `${f.alias}`]));
+          }
+        }
+
+        qb.select(...selectors);
+
+        qb.limit(1);
+
+        return await this.execAndParse(qb, null, {
+          first: true,
+          bulkAggregate: true,
+        });
+      } catch (err) {
+        logger.log(err);
+        return [];
+      }
+    });
+  }
+
+  async aggregate(args: { filterArr?: Filter[]; where?: string }, view?: View) {
+    return this.executeWithContext(async (trx) => {
+      try {
+        const { where, aggregation } = this._getListArgs(args as any);
+
+        const columns = await this.model.getColumns(this.context);
+
+        let viewColumns: any[];
+        if (this.viewId) {
+          viewColumns = (
+            await GridViewColumn.list(this.context, this.viewId)
+          ).filter((c) => {
+            const col = this.model.columnsById[c.fk_column_id];
+            return c.show && (view?.show_system_fields || !isSystemColumn(col));
+          });
+
+          if (aggregation?.length) {
+            viewColumns = viewColumns
+              .map((c) => {
+                const agg = aggregation.find((a) => a.field === c.fk_column_id);
+                return new GridViewColumn({
+                  ...c,
+                  show: !!agg,
+                  aggregation: agg ? agg.type : c.aggregation,
+                });
+              })
+              .filter((c) => c.show);
+          }
+        } else {
+          if (aggregation?.length) {
+            viewColumns = aggregation
+              .map((agg) => {
+                const col = this.model.columnsById[agg.field];
+                if (!col) return null;
+                return {
+                  fk_column_id: col.id,
+                  aggregation: agg.type,
+                  show: true,
+                };
+              })
+              .filter(Boolean);
+          } else {
+            viewColumns = [];
+          }
+        }
+
+        const aliasColObjMap = await this.model.getAliasColObjMap(
+          this.context,
+          columns,
+        );
+
+        const qb = trx(this.tnPath);
+
+        // Apply filers from view configuration, filterArr and where parameter
+        const { filters: filterObj } = extractFilterFromXwhere(
+          this.context,
+          where,
           aliasColObjMap,
         );
-        let aggFilterJson = f.filterArrJson;
-        try {
-          aggFilterJson = JSON.parse(aggFilterJson as any);
-        } catch (_e) {}
-
         await conditionV2(
           this,
           [
             ...(this.viewId
               ? [
                   new Filter({
-                    children: viewFilterList || [],
+                    children:
+                      (await Filter.rootFilterList(this.context, {
+                        viewId: this.viewId,
+                      })) || [],
                     is_group: true,
                   }),
                 ]
@@ -996,225 +1234,60 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
               logical_op: 'and',
             }),
             new Filter({
-              children: extractFilterFromXwhere(
-                this.context,
-                where,
-                aliasColObjMap,
-              ).filters,
+              children: filterObj,
               is_group: true,
               logical_op: 'and',
             }),
-            new Filter({
-              children: aggFilter,
-              is_group: true,
-              logical_op: 'and',
-            }),
-            ...(aggFilterJson
-              ? [
-                  new Filter({
-                    children: aggFilterJson as Filter[],
-                    is_group: true,
-                  }),
-                ]
-              : []),
           ],
-          tQb,
+          qb,
         );
 
-        let jsonBuildObject;
+        const selectors: Array<Knex.Raw> = [];
 
-        switch (this.dbDriver.client.config.client) {
-          case 'pg': {
-            jsonBuildObject = this.dbDriver.raw(
-              `JSON_BUILD_OBJECT(${Object.keys(aggregateExpressions)
-                .map((key) => {
-                  return `'${key}', ${aggregateExpressions[key]}`;
-                })
-                .join(', ')})`,
-            );
+        // Generating a knex raw aggregation query for each column in the view
+        await Promise.all(
+          viewColumns.map(async (viewColumn) => {
+            const col = columns.find((c) => c.id === viewColumn.fk_column_id);
+            if (!col) return null;
 
-            break;
-          }
-          case 'mysql2': {
-            jsonBuildObject = this.dbDriver.raw(`JSON_OBJECT(
-              ${Object.keys(aggregateExpressions)
-                .map((key) => `'${key}', ${aggregateExpressions[key]}`)
-                .join(', ')})`);
-            break;
-          }
+            if (!viewColumn.aggregation) return;
 
-          case 'sqlite3': {
-            jsonBuildObject = this.dbDriver.raw(`json_object(
-                ${Object.keys(aggregateExpressions)
-                  .map((key) => `'${key}', ${aggregateExpressions[key]}`)
-                  .join(', ')})`);
-            break;
-          }
-          default:
-            NcError.notImplemented(
-              'This database is not supported for bulk aggregation',
-            );
+            // Skip system LTAR columns
+            if (isLinksOrLTAR(col) && col.system) return;
+
+            const aggSql = await applyAggregation({
+              baseModelSqlv2: this,
+              aggregation: viewColumn.aggregation,
+              column: col,
+              alias: col.id,
+            });
+
+            if (aggSql) selectors.push(this.dbDriver.raw(aggSql));
+          }),
+        );
+
+        // If no queries are generated, return empty object
+        if (!selectors.length) {
+          return {};
         }
 
-        tQb.select(jsonBuildObject);
+        qb.select(...selectors);
 
-        if (this.dbDriver.client.config.client === 'mysql2') {
-          selectors.push(
-            this.dbDriver.raw('JSON_UNQUOTE(??) as ??', [
-              jsonBuildObject,
-              `${f.alias}`,
-            ]),
-          );
-        } else {
-          selectors.push(this.dbDriver.raw('(??) as ??', [tQb, `${f.alias}`]));
-        }
-      }
-
-      qb.select(...selectors);
-
-      qb.limit(1);
-
-      return await this.execAndParse(qb, null, {
-        first: true,
-        bulkAggregate: true,
-      });
-    } catch (err) {
-      logger.log(err);
-      return [];
-    }
-  }
-
-  async aggregate(args: { filterArr?: Filter[]; where?: string }, view?: View) {
-    try {
-      const { where, aggregation } = this._getListArgs(args as any);
-
-      const columns = await this.model.getColumns(this.context);
-
-      let viewColumns: any[];
-      if (this.viewId) {
-        viewColumns = (
-          await GridViewColumn.list(this.context, this.viewId)
-        ).filter((c) => {
-          const col = this.model.columnsById[c.fk_column_id];
-          return c.show && (view?.show_system_fields || !isSystemColumn(col));
+        // Some aggregation on Date, DateTime related columns may generate result other than Date, DateTime
+        // So skip the date conversion
+        const data = await this.execAndParse(qb, null, {
+          first: true,
+          skipDateConversion: true,
+          skipAttachmentConversion: true,
+          skipUserConversion: true,
         });
 
-        if (aggregation?.length) {
-          viewColumns = viewColumns
-            .map((c) => {
-              const agg = aggregation.find((a) => a.field === c.fk_column_id);
-              return new GridViewColumn({
-                ...c,
-                show: !!agg,
-                aggregation: agg ? agg.type : c.aggregation,
-              });
-            })
-            .filter((c) => c.show);
-        }
-      } else {
-        if (aggregation?.length) {
-          viewColumns = aggregation
-            .map((agg) => {
-              const col = this.model.columnsById[agg.field];
-              if (!col) return null;
-              return {
-                fk_column_id: col.id,
-                aggregation: agg.type,
-                show: true,
-              };
-            })
-            .filter(Boolean);
-        } else {
-          viewColumns = [];
-        }
-      }
-
-      const aliasColObjMap = await this.model.getAliasColObjMap(
-        this.context,
-        columns,
-      );
-
-      const qb = this.dbDriver(this.tnPath);
-
-      // Apply filers from view configuration, filterArr and where parameter
-      const { filters: filterObj } = extractFilterFromXwhere(
-        this.context,
-        where,
-        aliasColObjMap,
-      );
-      await conditionV2(
-        this,
-        [
-          ...(this.viewId
-            ? [
-                new Filter({
-                  children:
-                    (await Filter.rootFilterList(this.context, {
-                      viewId: this.viewId,
-                    })) || [],
-                  is_group: true,
-                }),
-              ]
-            : []),
-          new Filter({
-            children: args.filterArr || [],
-            is_group: true,
-            logical_op: 'and',
-          }),
-          new Filter({
-            children: filterObj,
-            is_group: true,
-            logical_op: 'and',
-          }),
-        ],
-        qb,
-      );
-
-      const selectors: Array<Knex.Raw> = [];
-
-      // Generating a knex raw aggregation query for each column in the view
-      await Promise.all(
-        viewColumns.map(async (viewColumn) => {
-          const col = columns.find((c) => c.id === viewColumn.fk_column_id);
-          if (!col) return null;
-
-          if (!viewColumn.aggregation) return;
-
-          // Skip system LTAR columns
-          if (isLinksOrLTAR(col) && col.system) return;
-
-          const aggSql = await applyAggregation({
-            baseModelSqlv2: this,
-            aggregation: viewColumn.aggregation,
-            column: col,
-            alias: col.id,
-          });
-
-          if (aggSql) selectors.push(this.dbDriver.raw(aggSql));
-        }),
-      );
-
-      // If no queries are generated, return empty object
-      if (!selectors.length) {
+        return data;
+      } catch (e) {
+        logger.log(e);
         return {};
       }
-
-      qb.select(...selectors);
-
-      // Some aggregation on Date, DateTime related columns may generate result other than Date, DateTime
-      // So skip the date conversion
-      const data = await this.execAndParse(qb, null, {
-        first: true,
-        skipDateConversion: true,
-        skipAttachmentConversion: true,
-        skipUserConversion: true,
-      });
-
-      return data;
-    } catch (e) {
-      logger.log(e);
-      return {};
-    }
+    });
   }
 
   async groupBy(args: {
@@ -1968,7 +2041,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   async delByPk(id, _trx?, cookie?) {
-    let trx: Knex.Transaction = _trx;
+    let trx: CustomTransaction = _trx;
     try {
       const source = await this.getSource();
       // retrieve data for handling params in hook
@@ -2053,7 +2126,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       }
       const where = await this._wherePk(id);
       if (!trx) {
-        trx = await this.dbDriver.transaction();
+        trx = await this.createTransaction();
       }
 
       await Promise.all(execQueries.map((q) => q(trx)));
@@ -2077,59 +2150,61 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   async hasLTARData(rowId, model: Model): Promise<any> {
-    const res = [];
-    const LTARColumns = (await model.getColumns(this.context)).filter(
-      (c) => c.uidt === UITypes.LinkToAnotherRecord,
-    );
-    let i = 0;
-    for (const column of LTARColumns) {
-      const colOptions = (await column.getColOptions(
-        this.context,
-      )) as LinkToAnotherRecordColumn;
-      const childColumn = await colOptions.getChildColumn(this.context);
-      const parentColumn = await colOptions.getParentColumn(this.context);
-      const childModel = await childColumn.getModel(this.context);
-      await childModel.getColumns(this.context);
-      const parentModel = await parentColumn.getModel(this.context);
-      await parentModel.getColumns(this.context);
-      let cnt = 0;
-      if (colOptions.type === RelationTypes.HAS_MANY) {
-        cnt = +(
-          await this.execAndParse(
-            this.dbDriver(this.getTnPath(childModel.table_name))
-              .count(childColumn.column_name, { as: 'cnt' })
-              .where(childColumn.column_name, rowId),
-            null,
-            { raw: true, first: true },
-          )
-        ).cnt;
-      } else if (colOptions.type === RelationTypes.MANY_TO_MANY) {
-        const mmModel = await colOptions.getMMModel(this.context);
-        const mmChildColumn = await colOptions.getMMChildColumn(this.context);
-        cnt = +(
-          await this.execAndParse(
-            this.dbDriver(this.getTnPath(mmModel.table_name))
-              .where(
-                `${this.getTnPath(mmModel.table_name)}.${
-                  mmChildColumn.column_name
-                }`,
-                rowId,
-              )
-              .count(mmChildColumn.column_name, { as: 'cnt' }),
-            null,
-            { first: true },
-          )
-        ).cnt;
+    return this.executeWithContext(async (trx) => {
+      const res = [];
+      const LTARColumns = (await model.getColumns(this.context)).filter(
+        (c) => c.uidt === UITypes.LinkToAnotherRecord,
+      );
+      let i = 0;
+      for (const column of LTARColumns) {
+        const colOptions = (await column.getColOptions(
+          this.context,
+        )) as LinkToAnotherRecordColumn;
+        const childColumn = await colOptions.getChildColumn(this.context);
+        const parentColumn = await colOptions.getParentColumn(this.context);
+        const childModel = await childColumn.getModel(this.context);
+        await childModel.getColumns(this.context);
+        const parentModel = await parentColumn.getModel(this.context);
+        await parentModel.getColumns(this.context);
+        let cnt = 0;
+        if (colOptions.type === RelationTypes.HAS_MANY) {
+          cnt = +(
+            await this.execAndParse(
+              trx(this.getTnPath(childModel.table_name))
+                .count(childColumn.column_name, { as: 'cnt' })
+                .where(childColumn.column_name, rowId),
+              null,
+              { raw: true, first: true },
+            )
+          ).cnt;
+        } else if (colOptions.type === RelationTypes.MANY_TO_MANY) {
+          const mmModel = await colOptions.getMMModel(this.context);
+          const mmChildColumn = await colOptions.getMMChildColumn(this.context);
+          cnt = +(
+            await this.execAndParse(
+              trx(this.getTnPath(mmModel.table_name))
+                .where(
+                  `${this.getTnPath(mmModel.table_name)}.${
+                    mmChildColumn.column_name
+                  }`,
+                  rowId,
+                )
+                .count(mmChildColumn.column_name, { as: 'cnt' }),
+              null,
+              { first: true },
+            )
+          ).cnt;
+        }
+        if (cnt) {
+          res.push(
+            `${i++ + 1}. ${model.title}.${
+              column.title
+            } is a LinkToAnotherRecord of ${childModel.title}`,
+          );
+        }
       }
-      if (cnt) {
-        res.push(
-          `${i++ + 1}. ${model.title}.${
-            column.title
-          } is a LinkToAnotherRecord of ${childModel.title}`,
-        );
-      }
-    }
-    return res;
+      return res;
+    });
   }
 
   async moveRecord({
@@ -2157,15 +2232,26 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       await this.getUniqueOrdersBeforeItem(beforeRowId, 1)
     )[0];
 
-    return await this.dbDriver(this.tnPath)
-      .update({
-        [columns.find((c) => c.uidt === UITypes.Order).column_name]:
-          newRecordOrder.toString(),
-      })
-      .where(await this._wherePk(rowId));
+    const trx = await this.createTransaction();
+
+    try {
+      const result = await trx(this.tnPath)
+        .update({
+          [columns.find((c) => c.uidt === UITypes.Order).column_name]:
+            newRecordOrder.toString(),
+        })
+        .where(await this._wherePk(rowId));
+
+      await trx.commit();
+      return result;
+    } catch (e) {
+      await trx.rollback();
+      throw e;
+    }
   }
 
-  async updateByPk(id, data, trx?, cookie?, _disableOptimization = false) {
+  async updateByPk(id, data, _trx?, cookie?, _disableOptimization = false) {
+    let trx: CustomTransaction = _trx;
     try {
       const columns = await this.model.getColumns(this.context);
 
@@ -2207,11 +2293,17 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
 
       await this.prepareNocoData(updateObj, false, cookie, prevData);
 
-      const query = this.dbDriver(this.tnPath)
+      if (!trx) {
+        trx = await this.createTransaction();
+      }
+
+      const query = trx(this.tnPath)
         .update(updateObj)
         .where(await this._wherePk(id, true));
 
       await this.execAndParse(query, null, { raw: true });
+
+      if (!_trx) await trx.commit();
 
       const newId = this.extractPksValues(
         {
@@ -2242,6 +2334,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       }
       return newData;
     } catch (e) {
+      if (!_trx) await trx?.rollback();
       await this.errorUpdate(e, data, trx, cookie);
       throw e;
     }
@@ -2336,7 +2429,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   async nestedInsert(data, request: NcRequest, _trx = null, param?) {
-    // const driver = trx ? trx : await this.dbDriver.transaction();
+    const trx = await this.createTransaction();
     try {
       const source = await this.getSource();
       await populatePk(this.context, this.model, data);
@@ -2347,7 +2440,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
         this.context,
         data,
         this.clientMeta,
-        this.dbDriver,
+        trx,
         columns,
       );
       let rowId = null;
@@ -2381,7 +2474,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
 
       await this.validate(insertObj, columns);
 
-      await this.beforeInsert(insertObj, this.dbDriver, request);
+      await this.beforeInsert(insertObj, trx, request);
 
       await this.prepareNocoData(insertObj, true, request, null, {
         ncOrder: null,
@@ -2389,10 +2482,10 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
         undo: param?.undo,
       });
 
-      await this.runOps(preInsertOps.map((f) => f()));
+      await this.runOps(preInsertOps.map((f) => f()), trx);
 
       let response;
-      const query = this.dbDriver(this.tnPath).insert(insertObj);
+      const query = trx(this.tnPath).insert(insertObj);
 
       if (this.isPg && this.model.primaryKey) {
         query.returning(
@@ -2435,7 +2528,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
             // sqlite doesnt return id after insert
             rowId = (
               await this.execAndParse(
-                this.dbDriver(this.tnPath)
+                trx(this.tnPath)
                   .select(ai.column_name)
                   .max(ai.column_name, { as: '__nc_ai_id' }),
                 null,
@@ -2448,7 +2541,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
           } else if (this.isSnowflake || this.isDatabricks) {
             rowId = (
               await this.execAndParse(
-                this.dbDriver(this.tnPath).max(ai.column_name, {
+                trx(this.tnPath).max(ai.column_name, {
                   as: '__nc_ai_id',
                 }),
                 null,
@@ -2488,7 +2581,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
         }
       }
 
-      await this.runOps(postInsertOps.map((f) => f(rowId)));
+      await this.runOps(postInsertOps.map((f) => f(rowId)), trx);
 
       // run link audit operations after link insert
       for (const f of postInsertAuditOps) {
@@ -2505,6 +2598,8 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
         });
       }
 
+      await trx.commit();
+
       await this.afterInsert({
         data: response,
         trx: this.dbDriver,
@@ -2518,6 +2613,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
 
       return response;
     } catch (e) {
+      await trx.rollback();
       throw e;
     }
   }
@@ -2590,7 +2686,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       undo?: boolean;
     } = {},
   ) {
-    let trx;
+    let trx: CustomTransaction;
     try {
       const columns = await this.model.getColumns(this.context);
 
@@ -2663,7 +2759,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
         }
       }
 
-      trx = await this.dbDriver.transaction();
+      trx = await this.createTransaction();
 
       const updatedPks = [];
 
@@ -2720,7 +2816,9 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
               ? await trx
                   .batchInsert(this.tnPath, toInsert, chunkSize)
                   .returning(
-                    this.model.primaryKeys?.length ? returningObj : '*',
+                    this.model.primaryKeys?.length
+                      ? Object.values(returningObj)
+                      : '*',
                   )
               : await trx.batchInsert(this.tnPath, toInsert, chunkSize);
         }
@@ -3137,7 +3235,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
         }
       }
 
-      transaction = await this.dbDriver.transaction();
+      transaction = await this.createTransaction();
       try {
         if (
           this.model.primaryKeys.length === 1 &&
@@ -3215,7 +3313,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   async updateLTARCols({ datas, cookie }: { datas: any[]; cookie: NcRequest }) {
-    const trx = await this.dbDriver.transaction();
+    const trx = await this.createTransaction();
 
     // Create a BaseModelSqlv2 instance that uses the transaction for operations
     // while preserving the original dbDriver reference for non-transactional operations
@@ -3325,6 +3423,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
     data,
     { cookie, skip_hooks = false }: { cookie: NcRequest; skip_hooks?: boolean },
   ) {
+    let trx: CustomTransaction;
     try {
       let count = 0;
 
@@ -3353,8 +3452,10 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       if (pkValues !== null && pkValues !== undefined) {
         // pk is specified - by pass
       } else {
+        trx = await this.createTransaction();
+
         const { where } = this._getListArgs(args);
-        const qb = this.dbDriver(this.tnPath);
+        const qb = trx(this.tnPath);
         const aliasColObjMap = await this.model.getAliasColObjMap(
           this.context,
           columns,
@@ -3416,6 +3517,8 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
         qb.update(updateData);
 
         await this.execAndParse(qb, null, { raw: true });
+
+        await trx.commit();
       }
 
       if (!args.skipValidationAndHooks && !skip_hooks)
@@ -3423,6 +3526,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
 
       return count;
     } catch (e) {
+      await trx?.rollback();
       throw e;
     }
   }
@@ -3576,7 +3680,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
 
       const idsVals = res.map((d) => d[this.model.primaryKey.column_name]);
 
-      transaction = await this.dbDriver.transaction();
+      transaction = await this.createTransaction();
 
       if (base.isMeta() && execQueries.length > 0) {
         for (const execQuery of execQueries) {
@@ -4246,21 +4350,23 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   public async getHighestOrderInTable(): Promise<BigNumber> {
-    const orderColumn = this.model.columns.find(
-      (c) => c.uidt === UITypes.Order,
-    );
+    return this.executeWithContext(async (trx) => {
+      const orderColumn = this.model.columns.find(
+        (c) => c.uidt === UITypes.Order,
+      );
 
-    if (!orderColumn) {
-      return null;
-    }
+      if (!orderColumn) {
+        return null;
+      }
 
-    const orderQuery = await this.dbDriver(this.tnPath)
-      .max(`${orderColumn.column_name} as max_order`)
-      .first();
+      const orderQuery = await trx(this.tnPath)
+        .max(`${orderColumn.column_name} as max_order`)
+        .first();
 
-    const order = new BigNumber(orderQuery ? orderQuery['max_order'] || 0 : 0);
+      const order = new BigNumber(orderQuery ? orderQuery['max_order'] || 0 : 0);
 
-    return order.plus(ORDER_STEP_INCREMENT);
+      return order.plus(ORDER_STEP_INCREMENT);
+    });
   }
 
   // method for validating otpions if column is single/multi select
@@ -4779,8 +4885,193 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       value: Record<string, unknown>[];
     }[]
   > {
-    try {
-      const { where, ...rest } = this._getListArgs(args as any);
+    return this.executeWithContext(async (trx) => {
+      try {
+        const { where, ...rest } = this._getListArgs(args as any);
+        const columns = await this.model.getColumns(this.context);
+        const column = columns?.find((col) => col.id === args.groupColumnId);
+
+        if (!column) NcError.fieldNotFound(args.groupColumnId);
+        if (isVirtualCol(column))
+          NcError.notImplemented('Grouping for virtual columns');
+
+        // extract distinct group column values
+        let groupingValues: Set<any>;
+        if (args.options?.length) {
+          groupingValues = new Set(args.options);
+        } else if (column.uidt === UITypes.SingleSelect) {
+          const colOptions = await column.getColOptions<{
+            options: SelectOption[];
+          }>(this.context);
+          groupingValues = new Set(
+            (colOptions?.options ?? []).map((opt) => opt.title),
+          );
+          groupingValues.add(null);
+        } else {
+          groupingValues = new Set(
+            (
+              await this.execAndParse(
+                trx(this.tnPath).select(column.column_name).distinct(),
+                null,
+                { raw: true },
+              )
+            ).map((row) => row[column.column_name]),
+          );
+          groupingValues.add(null);
+        }
+
+        const qb = trx(this.tnPath);
+        qb.limit(+rest?.limit || 25);
+        qb.offset(+rest?.offset || 0);
+
+        await this.selectObject({ qb, extractPkAndPv: true });
+
+        // todo: refactor and move to a method (applyFilterAndSort)
+        const aliasColObjMap = await this.model.getAliasColObjMap(
+          this.context,
+          columns,
+        );
+        let sorts = extractSortsObject(this.context, args?.sort, aliasColObjMap);
+        const { filters: filterObj } = extractFilterFromXwhere(
+          this.context,
+          where,
+          aliasColObjMap,
+        );
+        // todo: replace with view id
+        if (!args.ignoreViewFilterAndSort && this.viewId) {
+          await conditionV2(
+            this,
+            [
+              new Filter({
+                children:
+                  (await Filter.rootFilterList(this.context, {
+                    viewId: this.viewId,
+                  })) || [],
+                is_group: true,
+              }),
+              new Filter({
+                children: args.filterArr || [],
+                is_group: true,
+                logical_op: 'and',
+              }),
+              new Filter({
+                children: filterObj,
+                is_group: true,
+                logical_op: 'and',
+              }),
+            ],
+            qb,
+          );
+
+          if (!sorts)
+            sorts = args.sortArr?.length
+              ? args.sortArr
+              : await Sort.list(this.context, { viewId: this.viewId });
+
+          if (sorts?.['length']) await sortV2(this, sorts, qb);
+        } else {
+          await conditionV2(
+            this,
+            [
+              new Filter({
+                children: args.filterArr || [],
+                is_group: true,
+                logical_op: 'and',
+              }),
+              new Filter({
+                children: filterObj,
+                is_group: true,
+                logical_op: 'and',
+              }),
+            ],
+            qb,
+          );
+
+          if (!sorts) sorts = args.sortArr;
+
+          if (sorts?.['length']) await sortV2(this, sorts, qb);
+        }
+
+        // sort by primary key if not autogenerated string
+        // if autogenerated string sort by created_at column if present
+        const orderColumn = columns.find((c) => isOrderCol(c));
+
+        if (orderColumn) {
+          qb.orderBy(orderColumn.column_name);
+        } else if (this.model.primaryKey && this.model.primaryKey.ai) {
+          qb.orderBy(this.model.primaryKey.column_name);
+        } else if (
+          this.model.columns.find((c) => c.column_name === 'created_at')
+        ) {
+          qb.orderBy('created_at');
+        }
+
+        const groupedQb = trx.from(
+          trx
+            .unionAll(
+              [...groupingValues].map((r) => {
+                const query = qb.clone();
+                if (r === null) {
+                  query.where((qb) => {
+                    qb.whereNull(column.column_name);
+                    if (column.uidt === UITypes.SingleSelect) {
+                      qb.orWhere(column.column_name, '=', '');
+                    }
+                  });
+                } else {
+                  query.where(column.column_name, r);
+                }
+
+                return this.isSqlite ? trx.select().from(query) : query;
+              }),
+              !this.isSqlite,
+            )
+            .as('__nc_grouped_list'),
+        );
+
+        const proto = await this.getProto();
+
+        const data: any[] = await this.execAndParse(groupedQb);
+        const result = data?.map((d) => {
+          d.__proto__ = proto;
+          return d;
+        });
+
+        const groupedResult = result.reduce<Map<string | number | null, any[]>>(
+          (aggObj, row) => {
+            const rawVal = row[column.title];
+            // Treat empty strings as null
+            const val =
+              typeof rawVal === 'string' && rawVal === '' ? null : rawVal;
+
+            if (!aggObj.has(val)) {
+              aggObj.set(val, []);
+            }
+
+            aggObj.get(val).push(row);
+
+            return aggObj;
+          },
+          new Map(),
+        );
+
+        return [...groupingValues].map((key) => ({
+          key,
+          value: groupedResult.get(key) ?? [],
+        }));
+      } catch (e) {
+        throw e;
+      }
+    });
+  }
+
+  public async groupedListCount(
+    args: {
+      groupColumnId: string;
+      ignoreViewFilterAndSort?: boolean;
+    } & XcFilter,
+  ) {
+    return this.executeWithContext(async (trx) => {
       const columns = await this.model.getColumns(this.context);
       const column = columns?.find((col) => col.id === args.groupColumnId);
 
@@ -4788,49 +5079,30 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
       if (isVirtualCol(column))
         NcError.notImplemented('Grouping for virtual columns');
 
-      // extract distinct group column values
-      let groupingValues: Set<any>;
-      if (args.options?.length) {
-        groupingValues = new Set(args.options);
-      } else if (column.uidt === UITypes.SingleSelect) {
-        const colOptions = await column.getColOptions<{
-          options: SelectOption[];
-        }>(this.context);
-        groupingValues = new Set(
-          (colOptions?.options ?? []).map((opt) => opt.title),
+      const qb = trx(this.tnPath).count('*', { as: 'count' });
+
+      if (column.uidt === UITypes.SingleSelect) {
+        qb.groupBy(
+          trx.raw(`COALESCE(NULLIF(??, ''), NULL)`, [
+            column.column_name,
+          ]),
         );
-        groupingValues.add(null);
       } else {
-        groupingValues = new Set(
-          (
-            await this.execAndParse(
-              this.dbDriver(this.tnPath).select(column.column_name).distinct(),
-              null,
-              { raw: true },
-            )
-          ).map((row) => row[column.column_name]),
-        );
-        groupingValues.add(null);
+        qb.groupBy(column.column_name);
       }
 
-      const qb = this.dbDriver(this.tnPath);
-      qb.limit(+rest?.limit || 25);
-      qb.offset(+rest?.offset || 0);
-
-      await this.selectObject({ qb, extractPkAndPv: true });
-
-      // todo: refactor and move to a method (applyFilterAndSort)
+      // todo: refactor and move to a common method (applyFilterAndSort)
       const aliasColObjMap = await this.model.getAliasColObjMap(
         this.context,
         columns,
       );
-      let sorts = extractSortsObject(this.context, args?.sort, aliasColObjMap);
       const { filters: filterObj } = extractFilterFromXwhere(
         this.context,
-        where,
+        args.where,
         aliasColObjMap,
       );
       // todo: replace with view id
+
       if (!args.ignoreViewFilterAndSort && this.viewId) {
         await conditionV2(
           this,
@@ -4855,13 +5127,6 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
           ],
           qb,
         );
-
-        if (!sorts)
-          sorts = args.sortArr?.length
-            ? args.sortArr
-            : await Sort.list(this.context, { viewId: this.viewId });
-
-        if (sorts?.['length']) await sortV2(this, sorts, qb);
       } else {
         await conditionV2(
           this,
@@ -4879,176 +5144,21 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
           ],
           qb,
         );
-
-        if (!sorts) sorts = args.sortArr;
-
-        if (sorts?.['length']) await sortV2(this, sorts, qb);
       }
 
-      // sort by primary key if not autogenerated string
-      // if autogenerated string sort by created_at column if present
-      const orderColumn = columns.find((c) => isOrderCol(c));
-
-      if (orderColumn) {
-        qb.orderBy(orderColumn.column_name);
-      } else if (this.model.primaryKey && this.model.primaryKey.ai) {
-        qb.orderBy(this.model.primaryKey.column_name);
-      } else if (
-        this.model.columns.find((c) => c.column_name === 'created_at')
-      ) {
-        qb.orderBy('created_at');
-      }
-
-      const groupedQb = this.dbDriver.from(
-        this.dbDriver
-          .unionAll(
-            [...groupingValues].map((r) => {
-              const query = qb.clone();
-              if (r === null) {
-                query.where((qb) => {
-                  qb.whereNull(column.column_name);
-                  if (column.uidt === UITypes.SingleSelect) {
-                    qb.orWhere(column.column_name, '=', '');
-                  }
-                });
-              } else {
-                query.where(column.column_name, r);
-              }
-
-              return this.isSqlite ? this.dbDriver.select().from(query) : query;
-            }),
-            !this.isSqlite,
-          )
-          .as('__nc_grouped_list'),
-      );
-
-      const proto = await this.getProto();
-
-      const data: any[] = await this.execAndParse(groupedQb);
-      const result = data?.map((d) => {
-        d.__proto__ = proto;
-        return d;
+      await this.selectObject({
+        qb,
+        columns: [
+          new Column({
+            ...column,
+            title: 'key',
+            id: 'key',
+          }),
+        ],
       });
 
-      const groupedResult = result.reduce<Map<string | number | null, any[]>>(
-        (aggObj, row) => {
-          const rawVal = row[column.title];
-          // Treat empty strings as null
-          const val =
-            typeof rawVal === 'string' && rawVal === '' ? null : rawVal;
-
-          if (!aggObj.has(val)) {
-            aggObj.set(val, []);
-          }
-
-          aggObj.get(val).push(row);
-
-          return aggObj;
-        },
-        new Map(),
-      );
-
-      return [...groupingValues].map((key) => ({
-        key,
-        value: groupedResult.get(key) ?? [],
-      }));
-    } catch (e) {
-      throw e;
-    }
-  }
-
-  public async groupedListCount(
-    args: {
-      groupColumnId: string;
-      ignoreViewFilterAndSort?: boolean;
-    } & XcFilter,
-  ) {
-    const columns = await this.model.getColumns(this.context);
-    const column = columns?.find((col) => col.id === args.groupColumnId);
-
-    if (!column) NcError.fieldNotFound(args.groupColumnId);
-    if (isVirtualCol(column))
-      NcError.notImplemented('Grouping for virtual columns');
-
-    const qb = this.dbDriver(this.tnPath).count('*', { as: 'count' });
-
-    if (column.uidt === UITypes.SingleSelect) {
-      qb.groupBy(
-        this.dbDriver.raw(`COALESCE(NULLIF(??, ''), NULL)`, [
-          column.column_name,
-        ]),
-      );
-    } else {
-      qb.groupBy(column.column_name);
-    }
-
-    // todo: refactor and move to a common method (applyFilterAndSort)
-    const aliasColObjMap = await this.model.getAliasColObjMap(
-      this.context,
-      columns,
-    );
-    const { filters: filterObj } = extractFilterFromXwhere(
-      this.context,
-      args.where,
-      aliasColObjMap,
-    );
-    // todo: replace with view id
-
-    if (!args.ignoreViewFilterAndSort && this.viewId) {
-      await conditionV2(
-        this,
-        [
-          new Filter({
-            children:
-              (await Filter.rootFilterList(this.context, {
-                viewId: this.viewId,
-              })) || [],
-            is_group: true,
-          }),
-          new Filter({
-            children: args.filterArr || [],
-            is_group: true,
-            logical_op: 'and',
-          }),
-          new Filter({
-            children: filterObj,
-            is_group: true,
-            logical_op: 'and',
-          }),
-        ],
-        qb,
-      );
-    } else {
-      await conditionV2(
-        this,
-        [
-          new Filter({
-            children: args.filterArr || [],
-            is_group: true,
-            logical_op: 'and',
-          }),
-          new Filter({
-            children: filterObj,
-            is_group: true,
-            logical_op: 'and',
-          }),
-        ],
-        qb,
-      );
-    }
-
-    await this.selectObject({
-      qb,
-      columns: [
-        new Column({
-          ...column,
-          title: 'key',
-          id: 'key',
-        }),
-      ],
+      return await this.execAndParse(qb);
     });
-
-    return await this.execAndParse(qb);
   }
 
   public async execAndGetRows(query: string, trx?: Knex | CustomKnex) {
@@ -6073,76 +6183,78 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
     { colId, id }: { colId; id; apiVersion?: NcApiVersion },
     args: { limit?; offset?; fieldSet?: Set<string> } = {},
   ) {
-    try {
-      await this.model.getColumns(this.context);
+    return this.executeWithContext(async (trx) => {
+      try {
+        await this.model.getColumns(this.context);
 
-      const { where, sort } = this._getListArgs(args as any);
-      // todo: get only required fields
+        const { where, sort } = this._getListArgs(args as any);
+        // todo: get only required fields
 
-      const relColumn = this.model.columnsById[colId];
+        const relColumn = this.model.columnsById[colId];
 
-      const row = await this.execAndParse(
-        this.dbDriver(this.tnPath).where(await this._wherePk(id)),
-        null,
-        { raw: true, first: true },
-      );
+        const row = await this.execAndParse(
+          trx(this.tnPath).where(await this._wherePk(id)),
+          null,
+          { raw: true, first: true },
+        );
 
-      // validate rowId
-      if (!row) {
-        NcError.recordNotFound(id);
+        // validate rowId
+        if (!row) {
+          NcError.recordNotFound(id);
+        }
+
+        const parentCol = await (
+          (await relColumn.getColOptions(
+            this.context,
+          )) as LinkToAnotherRecordColumn
+        ).getParentColumn(this.context);
+        const parentTable = await parentCol.getModel(this.context);
+        const chilCol = await (
+          (await relColumn.getColOptions(
+            this.context,
+          )) as LinkToAnotherRecordColumn
+        ).getChildColumn(this.context);
+        const childTable = await chilCol.getModel(this.context);
+
+        const parentModel = await Model.getBaseModelSQL(this.context, {
+          model: parentTable,
+          dbDriver: this.dbDriver,
+        });
+        await childTable.getColumns(this.context);
+
+        const childTn = this.getTnPath(childTable);
+        const parentTn = this.getTnPath(parentTable);
+
+        const qb = trx(parentTn);
+        await this.applySortAndFilter({ table: parentTable, where, qb, sort });
+
+        qb.where(
+          parentCol.column_name,
+          trx(childTn)
+            .select(chilCol.column_name)
+            .where(_wherePk(childTable.primaryKeys, id)),
+        );
+
+        await parentModel.selectObject({ qb, fieldsSet: args.fieldSet });
+
+        const parent = await this.execAndParse(
+          qb,
+          await parentTable.getColumns(this.context),
+          {
+            first: true,
+          },
+        );
+
+        const proto = await parentModel.getProto();
+
+        if (parent) {
+          parent.__proto__ = proto;
+        }
+        return parent;
+      } catch (e) {
+        throw e;
       }
-
-      const parentCol = await (
-        (await relColumn.getColOptions(
-          this.context,
-        )) as LinkToAnotherRecordColumn
-      ).getParentColumn(this.context);
-      const parentTable = await parentCol.getModel(this.context);
-      const chilCol = await (
-        (await relColumn.getColOptions(
-          this.context,
-        )) as LinkToAnotherRecordColumn
-      ).getChildColumn(this.context);
-      const childTable = await chilCol.getModel(this.context);
-
-      const parentModel = await Model.getBaseModelSQL(this.context, {
-        model: parentTable,
-        dbDriver: this.dbDriver,
-      });
-      await childTable.getColumns(this.context);
-
-      const childTn = this.getTnPath(childTable);
-      const parentTn = this.getTnPath(parentTable);
-
-      const qb = this.dbDriver(parentTn);
-      await this.applySortAndFilter({ table: parentTable, where, qb, sort });
-
-      qb.where(
-        parentCol.column_name,
-        this.dbDriver(childTn)
-          .select(chilCol.column_name)
-          .where(_wherePk(childTable.primaryKeys, id)),
-      );
-
-      await parentModel.selectObject({ qb, fieldsSet: args.fieldSet });
-
-      const parent = await this.execAndParse(
-        qb,
-        await parentTable.getColumns(this.context),
-        {
-          first: true,
-        },
-      );
-
-      const proto = await parentModel.getProto();
-
-      if (parent) {
-        parent.__proto__ = proto;
-      }
-      return parent;
-    } catch (e) {
-      throw e;
-    }
+    });
   }
 
   async updateLastModified({
@@ -6197,157 +6309,169 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   async getUniqueOrdersBeforeItem(before: unknown, amount = 1, depth = 0) {
-    try {
-      if (depth > MAX_RECURSION_DEPTH) {
-        NcError.reorderFailed();
-      }
-
-      const orderColumn = this.model.columns.find((c) => isOrderCol(c));
-      if (!orderColumn) {
-        return;
-      }
-
-      if (!before) {
-        const highestOrder = await this.getHighestOrderInTable();
-
-        return Array.from({ length: amount }).map((_, i) => {
-          return highestOrder.plus(i + 1);
-        });
-      }
-
-      const row = await this.readByPk(
-        before,
-        false,
-        {},
-        { extractOrderColumn: true },
-      );
-
-      if (!row) {
-        return await this.getUniqueOrdersBeforeItem(null, amount, depth);
-      }
-
-      const currentRowOrder = new BigNumber(row[orderColumn.title] ?? 0);
-
-      const resultQuery = this.dbDriver(this.tnPath)
-        .where(orderColumn.column_name, '<', currentRowOrder.toString())
-        .max(orderColumn.column_name + ' as maxOrder')
-        .first();
-
-      const result = await resultQuery;
-
-      const adjacentOrder = new BigNumber(result.maxOrder || 0);
-
-      const orders = [];
-
-      for (let i = 0; i < amount; i++) {
-        const intermediateOrder = this.findIntermediateOrder(
-          adjacentOrder.plus(i),
-          currentRowOrder,
-        );
-
-        if (
-          intermediateOrder.eq(adjacentOrder) ||
-          intermediateOrder.eq(currentRowOrder)
-        ) {
-          throw NcError.cannotCalculateIntermediateOrderError();
+    return this.executeWithContext(async (trx) => {
+      try {
+        if (depth > MAX_RECURSION_DEPTH) {
+          NcError.reorderFailed();
         }
 
-        orders.push(intermediateOrder);
-      }
+        const orderColumn = this.model.columns.find((c) => isOrderCol(c));
+        if (!orderColumn) {
+          return;
+        }
 
-      return orders;
-    } catch (error) {
-      if (error.error === NcErrorType.CANNOT_CALCULATE_INTERMEDIATE_ORDER) {
-        console.error('Error in getUniqueOrdersBeforeItem:', error);
-        await this.recalculateFullOrder();
-        return await this.getUniqueOrdersBeforeItem(before, amount, depth + 1);
+        if (!before) {
+          const highestOrder = await this.getHighestOrderInTable();
+
+          return Array.from({ length: amount }).map((_, i) => {
+            return highestOrder.plus(i + 1);
+          });
+        }
+
+        const row = await this.readByPk(
+          before,
+          false,
+          {},
+          { extractOrderColumn: true },
+        );
+
+        if (!row) {
+          return await this.getUniqueOrdersBeforeItem(null, amount, depth);
+        }
+
+        const currentRowOrder = new BigNumber(row[orderColumn.title] ?? 0);
+
+        const resultQuery = trx(this.tnPath)
+          .where(orderColumn.column_name, '<', currentRowOrder.toString())
+          .max(orderColumn.column_name + ' as maxOrder')
+          .first();
+
+        const result = await resultQuery;
+
+        const adjacentOrder = new BigNumber(result.maxOrder || 0);
+
+        const orders = [];
+
+        for (let i = 0; i < amount; i++) {
+          const intermediateOrder = this.findIntermediateOrder(
+            adjacentOrder.plus(i),
+            currentRowOrder,
+          );
+
+          if (
+            intermediateOrder.eq(adjacentOrder) ||
+            intermediateOrder.eq(currentRowOrder)
+          ) {
+            throw NcError.cannotCalculateIntermediateOrderError();
+          }
+
+          orders.push(intermediateOrder);
+        }
+
+        return orders;
+      } catch (error) {
+        if (error.error === NcErrorType.CANNOT_CALCULATE_INTERMEDIATE_ORDER) {
+          console.error('Error in getUniqueOrdersBeforeItem:', error);
+          await this.recalculateFullOrder();
+          return await this.getUniqueOrdersBeforeItem(before, amount, depth + 1);
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
   async recalculateFullOrder() {
-    const primaryKeys = this.model.primaryKeys.map((pk) => pk.column_name);
+    const trx = await this.createTransaction();
+    try {
+      const primaryKeys = this.model.primaryKeys.map((pk) => pk.column_name);
 
-    const sql = {
-      mysql2: {
-        modern: `UPDATE ?? SET ?? = ROW_NUMBER() OVER (ORDER BY ?? ASC)`, // 8.0+
-        legacy: {
-          // 5.x and below
-          init: 'SET @row_number = 0;',
-          update:
-            'UPDATE ?? SET ?? = (@row_number:=@row_number+1) ORDER BY ?? ASC',
+      const sql = {
+        mysql2: {
+          modern: `UPDATE ?? SET ?? = ROW_NUMBER() OVER (ORDER BY ?? ASC)`, // 8.0+
+          legacy: {
+            // 5.x and below
+            init: 'SET @row_number = 0;',
+            update:
+              'UPDATE ?? SET ?? = (@row_number:=@row_number+1) ORDER BY ?? ASC',
+          },
         },
-      },
-      pg: `UPDATE ?? t SET ?? = s.rn FROM (SELECT ??, ${primaryKeys
-        .map((_pk) => `??`)
-        .join(
-          ', ',
-        )}, ROW_NUMBER() OVER (ORDER BY ?? ASC) rn FROM ??) s WHERE ${this.model.primaryKeys
-        .map((_pk) => `t.?? = s.??`)
-        .join(' AND ')}`,
-      sqlite3: `WITH rn AS (SELECT ${this.model.primaryKeys
-        .map((_pk) => `??`)
-        .join(
-          ', ',
-        )}, ROW_NUMBER() OVER (ORDER BY ?? ASC) rn FROM ??) UPDATE ?? SET ?? = (SELECT rn FROM rn WHERE ${this.model.primaryKeys
-        .map((_pk) => `rn.?? = ??.??`)
-        .join(' AND ')})`,
-    };
+        pg: `UPDATE ?? t SET ?? = s.rn FROM (SELECT ??, ${primaryKeys
+          .map((_pk) => `??`)
+          .join(
+            ', ',
+          )}, ROW_NUMBER() OVER (ORDER BY ?? ASC) rn FROM ??) s WHERE ${this.model.primaryKeys
+          .map((_pk) => `t.?? = s.??`)
+          .join(' AND ')}`,
+        sqlite3: `WITH rn AS (SELECT ${this.model.primaryKeys
+          .map((_pk) => `??`)
+          .join(
+            ', ',
+          )}, ROW_NUMBER() OVER (ORDER BY ?? ASC) rn FROM ??) UPDATE ?? SET ?? = (SELECT rn FROM rn WHERE ${this.model.primaryKeys
+          .map((_pk) => `rn.?? = ??.??`)
+          .join(' AND ')})`,
+      };
 
-    const orderColumn = this.model.columns.find((c) => isOrderCol(c));
-    if (!orderColumn) {
-      NcError.badRequest('Order column not found to recalculateOrder');
-    }
+      const orderColumn = this.model.columns.find((c) => isOrderCol(c));
+      if (!orderColumn) {
+        NcError.badRequest('Order column not found to recalculateOrder');
+      }
 
-    const client = this.dbDriver.client.config.client;
-    if (!sql[client]) {
-      NcError.notImplemented(
-        'Recalculate order not implemented for this database',
-      );
-    }
-
-    const params = {
-      mysql2: [this.tnPath, orderColumn.column_name, orderColumn.column_name],
-      pg: [
-        this.tnPath,
-        orderColumn.column_name,
-        orderColumn.column_name,
-        ...primaryKeys,
-        orderColumn.column_name,
-        this.tnPath,
-        ...primaryKeys.flatMap((pk) => [pk, pk]), // Flatten pk array for binding
-      ],
-      sqlite3: [
-        ...primaryKeys,
-        orderColumn.column_name,
-        this.tnPath,
-        this.tnPath,
-        orderColumn.column_name,
-        ...primaryKeys.flatMap((pk) => [pk, this.tnPath, pk]), // Flatten pk array for binding
-      ],
-    };
-
-    // For MySQL, check version and use appropriate query
-    if (client === 'mysql2') {
-      const version = await this.execAndGetRows('SELECT VERSION()');
-      const isMySql8Plus = parseFloat(version[0]?.[0]?.['VERSION()']) >= 8.0;
-
-      if (isMySql8Plus) {
-        await this.execAndGetRows(
-          this.dbDriver.raw(sql[client].modern, params[client]).toQuery(),
-        );
-      } else {
-        await this.execAndGetRows(sql[client].legacy.init);
-        await this.execAndGetRows(
-          this.dbDriver
-            .raw(sql[client].legacy.update, params[client])
-            .toQuery(),
+      const client = this.dbDriver.client.config.client;
+      if (!sql[client]) {
+        NcError.notImplemented(
+          'Recalculate order not implemented for this database',
         );
       }
-    } else {
-      const query = this.dbDriver.raw(sql[client], params[client]).toQuery();
-      await this.execAndGetRows(query);
+
+      const params = {
+        mysql2: [this.tnPath, orderColumn.column_name, orderColumn.column_name],
+        pg: [
+          this.tnPath,
+          orderColumn.column_name,
+          orderColumn.column_name,
+          ...primaryKeys,
+          orderColumn.column_name,
+          this.tnPath,
+          ...primaryKeys.flatMap((pk) => [pk, pk]), // Flatten pk array for binding
+        ],
+        sqlite3: [
+          ...primaryKeys,
+          orderColumn.column_name,
+          this.tnPath,
+          this.tnPath,
+          orderColumn.column_name,
+          ...primaryKeys.flatMap((pk) => [pk, this.tnPath, pk]), // Flatten pk array for binding
+        ],
+      };
+
+      // For MySQL, check version and use appropriate query
+      if (client === 'mysql2') {
+        const version = await this.execAndGetRows('SELECT VERSION()', trx);
+        const isMySql8Plus = parseFloat(version[0]?.[0]?.['VERSION()']) >= 8.0;
+
+        if (isMySql8Plus) {
+          await this.execAndGetRows(
+            this.dbDriver.raw(sql[client].modern, params[client]).toQuery(),
+            trx,
+          );
+        } else {
+          await this.execAndGetRows(sql[client].legacy.init, trx);
+          await this.execAndGetRows(
+            this.dbDriver
+              .raw(sql[client].legacy.update, params[client])
+              .toQuery(),
+            trx,
+          );
+        }
+      } else {
+        const query = this.dbDriver.raw(sql[client], params[client]).toQuery();
+        await this.execAndGetRows(query, trx);
+      }
+
+      await trx.commit();
+    } catch (e) {
+      await trx.rollback();
+      throw e;
     }
   }
 

@@ -17,6 +17,7 @@ import type {
 } from 'nocodb-sdk';
 import type { Knex } from 'knex';
 import type CustomKnex from '~/db/CustomKnex';
+import type { CustomTransaction } from '~/db/CustomKnex';
 import type { Column, Filter, Model, Sort, Source, View } from '~/models';
 
 export interface IBaseModelSqlV2 {
@@ -358,6 +359,12 @@ export interface IBaseModelSqlV2 {
    * that need to run outside the current transaction context.
    */
   getNonTransactionalClone(): IBaseModelSqlV2;
+  /**
+   * Creates a database transaction for write operations.
+   * Use this method instead of dbDriver.transaction() to ensure
+   * proper context setup (e.g., RLS context for PostgreSQL).
+   */
+  createTransaction(): Promise<CustomTransaction>;
 
   get viewId(): string;
   /** Returns the active database driver (transaction if active, otherwise base driver) */

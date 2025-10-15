@@ -284,7 +284,7 @@ export const baseModelInsert = (baseModel: IBaseModelSqlV2) => {
       // refer : https://www.sqlite.org/limits.html
       const chunkSize = baseModel.isSqlite ? 10 : _chunkSize;
 
-      trx = await baseModel.dbDriver.transaction();
+      trx = await baseModel.createTransaction();
 
       if (!foreign_key_checks) {
         if (baseModel.isPg) {

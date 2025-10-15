@@ -1561,4 +1561,4 @@ const parseConditionv2 = (_obj: Filter | FilterType, qb: Knex.QueryBuilder) => {
 };
 
 export default CustomKnex;
-export { Knex, CustomKnex as XKnex };
+export { Knex, CustomKnex as XKnex, CustomTransaction };

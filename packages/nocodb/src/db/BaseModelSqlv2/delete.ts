@@ -269,7 +269,7 @@ export class BaseModelDelete {
         ignoreViewFilterAndSort: true,
       },
     );
-    const trx = await this.baseModel.dbDriver.transaction();
+    const trx = await this.baseModel.createTransaction();
     try {
       for (const execQuery of execQueries) {
         await Promise.all(execQuery({ trx, qb: qb.clone(), ids, rows }));
