@@ -2429,7 +2429,7 @@ class BaseModelSqlv2 implements IBaseModelSqlV2 {
   }
 
   get clientType() {
-    return this.knex.clientType();
+    return this.knex?.client?.config?.client;
   }
 
   public async readRecord(params: {
